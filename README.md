@@ -1,6 +1,6 @@
 # GenomeFISH
 
-Scripts are contained in the scripts directory and are written in Python 2.x.
+Scripts are contained in the scripts directory and are written in Python 2.x. No installation is required. Simply copy the scripts to your system and ensure you have the required dependencies as detailed below.
 
 ## Calculating pairwise average nucleotide identity
 
