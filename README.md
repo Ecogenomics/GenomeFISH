@@ -12,7 +12,7 @@ Requirements:
 Calculates pairwise average nucleotide identity (ANI) values between a set of genomes:
 > ani.py <gene_dir> <output_dir>
 
-where <gene_dir> contains FASTA files of genes in nucleotide space for two or more genomes and <output_dir> is the desired output directory for results. FASTA files must end with a '.fna' extension. The number of CPUs to use can be specified with the "--threads" parameter.
+where <gene_dir> contains FASTA files of genes in nucleotide space for two or more genomes and <output_dir> is the desired output directory for results. FASTA files must end with a '.fna' or '.fasta' extension. The number of CPUs to use can be specified with the "--threads" parameter.
 
 ## Simulating <i>in silico</i> probes
 
