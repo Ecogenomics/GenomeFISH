@@ -24,7 +24,7 @@ __author__ = 'Donovan Parks'
 __copyright__ = 'Copyright 2018'
 __credits__ = ['Donovan Parks']
 __license__ = 'GPL3'
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 __maintainer__ = 'Donovan Parks'
 __email__ = 'donovan.parks@gmail.com'
 __status__ = 'Development'
@@ -34,6 +34,7 @@ import sys
 import ntpath
 import argparse
 import logging
+import string
 import itertools
 import shutil
 import tempfile
@@ -42,8 +43,8 @@ import multiprocessing as mp
 from collections import defaultdict, namedtuple
 
 from biolib.external.execute import check_dependencies
-from biolib.seq_io import read_fasta
 from biolib.seq_tk import rev_comp
+from biolib.seq_io import read_fasta
 from biolib.logger import logger_setup
 
 
@@ -67,25 +68,26 @@ class ProbeMatches(object):
         
         logger_setup(output_dir, "in_silico_probes.log", "in_silico_probes", __version__, False)
         self.logger = logging.getLogger('timestamp')
-        
+
         self.temp = temp
         self.na_plus = na_plus
         self.ct = ct
         self.free_energy_threshold = free_energy_threshold
         
-        self.output_fmt = '6 qseqid qstart qend qseq sseqid sstart send sseq pident evalue bitscore'
-        
+        self.output_fmt = '6 qseqid qlen qseq sseqid slen sseq length mismatch gaps pident bitscore evalue'
+
         self.BlastHit = namedtuple('BlastHit', """query_id
-                                                query_start
-                                                query_end
+                                                query_len
                                                 query_aln_seq
                                                 subject_id
-                                                subject_start
-                                                subject_end
+                                                subject_len
                                                 subject_aln_seq
+                                                aln_len
+                                                mismatch
+                                                gaps
                                                 perc_identity
-                                                evalue
-                                                bitscore""")
+                                                bitscore
+                                                evalue""")
         
     def _blastn(self, query_seqs, nucl_db, output_file, evalue=1e-3, max_matches=500, task='megablast'):
         """Apply blastn to query file.
@@ -118,6 +120,7 @@ class ProbeMatches(object):
         cmd += " -task %s" % task
         cmd += " -outfmt '%s'" % self.output_fmt
         cmd += " -gapopen 1000 -gapextend 1000 -penalty -2 -reward 3"
+        cmd += " -dust no -soft_masking false"
         os.system(cmd)
         
     def _read_hit(self, table):
@@ -144,16 +147,17 @@ class ProbeMatches(object):
         for line in open_file(table):
             line_split = line.split('\t')
             hit = self.BlastHit(query_id=line_split[0],
-                            query_start=int(line_split[1]),
-                            query_end=int(line_split[2]),
-                            query_aln_seq=line_split[3],
-                            subject_id=line_split[4],
-                            subject_start=int(line_split[5]),
-                            subject_end=int(line_split[6]),
-                            subject_aln_seq=line_split[7],
-                            perc_identity=float(line_split[8]),
-                            evalue=float(line_split[9]),
-                            bitscore=float(line_split[10]))
+                            query_len=int(line_split[1]),
+                            query_aln_seq=line_split[2],
+                            subject_id=line_split[3],
+                            subject_len=int(line_split[4]),
+                            subject_aln_seq=line_split[5],
+                            aln_len=int(line_split[6]),
+                            mismatch=int(line_split[7]),
+                            gaps=int(line_split[8]),
+                            perc_identity=float(line_split[9]),
+                            bitscore=float(line_split[10]),
+                            evalue=float(line_split[11]))
 
             yield hit
         
@@ -188,14 +192,13 @@ class ProbeMatches(object):
         
         return dG
         
-    def _free_energy_test(self, probe, target_seq): 
-        """Determine if probe and target sequence pass free energy test for hybridization."""
+    def _free_energy_of_formation(self, probe, target_seq): 
+        """Determine free energy of formation between probe and target sequence."""
         
         assert(len(probe) == len(target_seq))
         
         # dG_perfect_complement; free energy for perfect complement
-        comp_probe = rev_comp(probe)[::-1]
-        pc = self._free_energy(probe, comp_probe)
+        pc = self._free_energy(probe, rev_comp(probe))
         
         # dG_mismatched; free energy for target sequence
         mm = self._free_energy(probe, target_seq)
@@ -203,12 +206,14 @@ class ProbeMatches(object):
         # ddG = -dG_perfect_complement + dG_mismatched
         ddG = -pc + mm
         
-        return ddG <= self.free_energy_threshold
+        return ddG
 
     def __workerThread(self, 
                         probe_size,
                         probe_step_size,
                         mismatch,
+                        min_aln_len,
+                        keep_fragments,
                         results_dir,
                         queueIn, 
                         queueOut):
@@ -216,9 +221,7 @@ class ProbeMatches(object):
         
         The reference genome is the genome from which probes are being
         designed. The aim is to determine how many of these 
-        reference probes will hybridize to the target genome. The 
-        percentage of hybridize probes to total reference probes
-        should correlate with signal intensity.
+        reference probes will hybridize to the target genome. 
 
         To determine the number of reference probes which will hybridize
         to the target genome, the target genome is fragmented
@@ -234,7 +237,10 @@ class ProbeMatches(object):
             ref_name = ntpath.basename(ref_genome).replace('.fasta', '').replace('.fna', '')
             target_name = ntpath.basename(target_genome).replace('.fasta', '').replace('.fna', '')
             
-            tmp_dir = tempfile.mkdtemp()
+            if keep_fragments:
+                fragment_dir = os.path.join(results_dir, 'fragments')
+            else:
+                fragment_dir = tempfile.mkdtemp()
 
             # count total number of reference genome probes
             ref_seqs = read_fasta(ref_genome)
@@ -245,7 +251,7 @@ class ProbeMatches(object):
                 ref_genome_size += len(seq)
 
             # fragment target genome into probe sized windows
-            window_file = os.path.join(tmp_dir, 'windows.fna')
+            window_file = os.path.join(fragment_dir, ref_name + '~' + target_name + '.fna')
             fout = open(window_file, 'w')
             target_seqs = read_fasta(target_genome)
             num_target_probes = 0
@@ -275,26 +281,29 @@ class ProbeMatches(object):
             failed_free_energy_test = set()
             output_file = os.path.join(results_dir, ref_name + '~' + target_name + '.probe_hits.tsv')
             fout = open(output_file, 'w')
-            fout.write('Probe ID\tSubject ID\tProbe percent alignment\tSubject percent alignment\tPercent identity\tAdjusted percent identity\n')
+            fout.write('Probe ID\tSubject ID\tProbe percent alignment\tPercent identity\tAdjusted percent identity\tFree energy of formation\n')
             for hit in self._read_hit(output_table):
-                query_aln_frac = float(abs(hit.query_end - hit.query_start) + 1) / probe_size
-                subject_aln_frac = float(abs(hit.subject_end - hit.subject_start) + 1) / probe_size
-            
-                adjusted_perc_identity = min(query_aln_frac, subject_aln_frac) * (hit.perc_identity/100.0)
-                if query_aln_frac >= 0.95 and subject_aln_frac >= 0.95 and adjusted_perc_identity >= (1.0 - mismatch):
-                    probe = hit.subject_aln_seq
-                    target_seq = hit.query_aln_seq
-                    
-                    if hit.query_id not in window_hits and self._free_energy_test(probe, target_seq):
-                        window_hits.add(hit.query_id)
-                        fout.write('%s\t%s\t%.1f\t%.1f\t%.1f\t%.1f\n' % (hit.query_id, 
-                                                                        hit.subject_id, 
-                                                                        query_aln_frac*100,
-                                                                        subject_aln_frac*100,
-                                                                        hit.perc_identity,
-                                                                        adjusted_perc_identity*100))
-                    else:
-                        failed_free_energy_test.add(hit.query_id)
+                adj_aln_len = hit.aln_len - hit.gaps
+                query_aln_frac = adj_aln_len * 100.0 / hit.query_len
+                adjusted_perc_identity = (adj_aln_len - hit.mismatch) * 100.0 / hit.query_len
+
+                if (query_aln_frac >= (100*min_aln_len)
+                    and adjusted_perc_identity >= (100*(1.0 - mismatch))):
+
+                    if hit.query_id not in window_hits:
+                        probe = hit.subject_aln_seq
+                        target_seq = rev_comp(hit.query_aln_seq) # don't want genomic region on same strand, but likely hybridization on the other strand
+                        ddG = self._free_energy_of_formation(probe, target_seq)
+                        if ddG <= self.free_energy_threshold:
+                            window_hits.add(hit.query_id)
+                            fout.write('%s\t%s\t%.1f\t%.1f\t%.1f\t%.2f\n' % (hit.query_id, 
+                                                                                hit.subject_id, 
+                                                                                query_aln_frac,
+                                                                                hit.perc_identity,
+                                                                                adjusted_perc_identity,
+                                                                                ddG))
+                        else:
+                            failed_free_energy_test.add(hit.query_id)
                 else:
                     failed_similarity_test.add(hit.query_id)
             fout.close()
@@ -314,7 +323,8 @@ class ProbeMatches(object):
             fout.write('\n')
             fout.close()
             
-            shutil.rmtree(tmp_dir)
+            if not keep_fragments:
+                shutil.rmtree(fragment_dir)
 
             # allow results to be processed or written to file
             queueOut.put(ref_name)
@@ -408,8 +418,20 @@ class ProbeMatches(object):
                 probe_size,
                 probe_step_size,
                 mismatch,
+                min_aln_len,
                 ani_matrix, 
+                keep_fragments,
                 threads):
+                
+        # create results and fragments directory
+        results_dir = os.path.join(self.output_dir, 'results')
+        if not os.path.exists(results_dir):
+            os.makedirs(results_dir)
+                
+        if keep_fragments:
+            fragment_dir = os.path.join(results_dir, 'fragments')
+            if not os.path.exists(fragment_dir):
+                os.makedirs(fragment_dir)
 
         # read gene files to process
         genome_files = []
@@ -441,13 +463,11 @@ class ProbeMatches(object):
             workerQueue.put((None, None))
 
         try:
-            results_dir = os.path.join(self.output_dir, 'results')
-            if not os.path.exists(results_dir):
-                os.makedirs(results_dir)
-            
             workerProc = [mp.Process(target = self.__workerThread, args = (probe_size,
                                                                             probe_step_size,
                                                                             mismatch,
+                                                                            min_aln_len,
+                                                                            keep_fragments,
                                                                             results_dir,
                                                                             workerQueue, 
                                                                             writerQueue)) for _ in range(threads)]
@@ -483,11 +503,13 @@ if __name__ == '__main__':
     parser.add_argument('output_dir', help='output directory')
     parser.add_argument('--probe_size', help='probe/window size', type=int, default=120)
     parser.add_argument('--probe_step_size', help='step size for generating in silico probes', type=int, default=120)
-    parser.add_argument('--mismatch', help='maximum percent mismatch between probe and target for hybridization', type=float, default=0.15)
+    parser.add_argument('--mismatch', help='maximum percent mismatch between probe and target for hybridization [0,1]', type=float, default=0.15)
+    parser.add_argument('--min_aln_len', help='minimum percent alignment length of probe for hybridization [0,1]', type=float, default=0.85)
     parser.add_argument('--temp', help='temperature for calculating the free energy penalty', type=float, default=48)
     parser.add_argument('--na_plus', help='concentration of Na+ for calculating the free energy penalty', type=float, default=0.825)
     parser.add_argument('--ct', help='nucleic acid concentration in M for calculating the free energy penalty', type=float, default=0.000000005)
     parser.add_argument('--free_energy_threshold', help='threshold for free energy penalty', type=float, default=2)
+    parser.add_argument('--keep_fragments', action='store_true', help='retain file with query fragments')
     parser.add_argument('-t', '--threads', help='number of threads', type=int, default=1)
 
     args = parser.parse_args()
@@ -502,7 +524,9 @@ if __name__ == '__main__':
                 args.probe_size,
                 args.probe_step_size,
                 args.mismatch,
+                args.min_aln_len,
                 args.ani_matrix, 
+                args.keep_fragments,
                 args.threads)
     except SystemExit:
         print("\nControlled exit resulting from an unrecoverable error or warning.")

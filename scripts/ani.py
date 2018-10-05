@@ -37,10 +37,13 @@ import itertools
 import multiprocessing as mp
 from collections import defaultdict
 
+from biolib.external.execute import check_dependencies
+
 
 class ANI(object):
     def __init__(self):
-        pass
+        
+        check_dependencies(['ani_calculator'])
 
     def __workerThread(self, output_dir, queueIn, queueOut):
         """Process each data item in parallel."""
@@ -142,10 +145,8 @@ class ANI(object):
         # read gene files to process
         gene_files = []
         for gene_file in os.listdir(gene_dir):
-            if not gene_file.endswith('.fna'):
-                continue
-                
-            gene_files.append(os.path.join(gene_dir, gene_file))
+            if gene_file.endswith('.fna') or gene_file.endswith('.fasta'):
+                gene_files.append(os.path.join(gene_dir, gene_file))
         
         # populate worker queue with data to process
         workerQueue = mp.Queue()
