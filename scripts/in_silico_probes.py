@@ -24,7 +24,7 @@ __author__ = 'Donovan Parks'
 __copyright__ = 'Copyright 2018'
 __credits__ = ['Donovan Parks']
 __license__ = 'GPL3'
-__version__ = '0.0.2'
+__version__ = '0.0.3'
 __maintainer__ = 'Donovan Parks'
 __email__ = 'donovan.parks@gmail.com'
 __status__ = 'Development'
@@ -51,15 +51,10 @@ from biolib.logger import logger_setup
 class ProbeMatches(object):
     """Identify near identical matches of probes between genomes."""
     
-    def __init__(self, 
-                    temp,
-                    na_plus,
-                    ct,
-                    free_energy_threshold,
-                    output_dir):
+    def __init__(self, output_dir):
         """Initialization."""
         
-        check_dependencies(['melt.pl', 'blastn', 'makeblastdb'])
+        check_dependencies(['blastn', 'makeblastdb'])
         
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -68,11 +63,6 @@ class ProbeMatches(object):
         
         logger_setup(output_dir, "in_silico_probes.log", "in_silico_probes", __version__, False)
         self.logger = logging.getLogger('timestamp')
-
-        self.temp = temp
-        self.na_plus = na_plus
-        self.ct = ct
-        self.free_energy_threshold = free_energy_threshold
         
         self.output_fmt = '6 qseqid qlen qseq sseqid slen sseq length mismatch gaps pident bitscore evalue'
 
@@ -160,53 +150,6 @@ class ProbeMatches(object):
                             evalue=float(line_split[11]))
 
             yield hit
-        
-    def _free_energy(self, seq1, seq2):
-        """Calculate free energy between two sequences."""
-        
-        seq1_file = 'seq1_' + str(uuid.uuid4())
-        fout = open(seq1_file, 'w')
-        fout.write(seq1 + '\n')
-        fout.close()
-        
-        seq2_file = 'seq2_' + str(uuid.uuid4())
-        fout = open(seq2_file, 'w')
-        fout.write(seq2 + '\n')
-        fout.close()
-        
-        cmd = 'melt.pl -n DNA -t %g -N %g -C %g -p %s %s > /dev/null' % (self.temp, 
-                                                                        self.na_plus, 
-                                                                        self.ct,
-                                                                        seq1_file, 
-                                                                        seq2_file)
-        os.system(cmd)
-        
-        lines = open('%s-%s.dG' % (seq1_file, seq2_file)).readlines()
-        results = lines[-1].split()
-        dG = float(results[1])
-
-        os.remove(seq1_file)
-        os.remove(seq2_file)
-        cmd = 'rm %s-%s.*' % (seq1_file, seq2_file)
-        os.system(cmd)
-        
-        return dG
-        
-    def _free_energy_of_formation(self, probe, target_seq): 
-        """Determine free energy of formation between probe and target sequence."""
-        
-        assert(len(probe) == len(target_seq))
-        
-        # dG_perfect_complement; free energy for perfect complement
-        pc = self._free_energy(probe, rev_comp(probe))
-        
-        # dG_mismatched; free energy for target sequence
-        mm = self._free_energy(probe, target_seq)
-        
-        # ddG = -dG_perfect_complement + dG_mismatched
-        ddG = -pc + mm
-        
-        return ddG
 
     def __workerThread(self, 
                         probe_size,
@@ -278,10 +221,9 @@ class ProbeMatches(object):
 
             window_hits = set()
             failed_similarity_test = set()
-            failed_free_energy_test = set()
             output_file = os.path.join(results_dir, ref_name + '~' + target_name + '.probe_hits.tsv')
             fout = open(output_file, 'w')
-            fout.write('Probe ID\tSubject ID\tProbe percent alignment\tPercent identity\tAdjusted percent identity\tFree energy of formation\n')
+            fout.write('Probe ID\tSubject ID\tProbe percent alignment\tPercent identity\tAdjusted percent identity\n')
             for hit in self._read_hit(output_table):
                 adj_aln_len = hit.aln_len - hit.gaps
                 query_aln_frac = adj_aln_len * 100.0 / hit.query_len
@@ -291,35 +233,29 @@ class ProbeMatches(object):
                     and adjusted_perc_identity >= (100*(1.0 - mismatch))):
 
                     if hit.query_id not in window_hits:
-                        probe = hit.subject_aln_seq
-                        target_seq = rev_comp(hit.query_aln_seq) # don't want genomic region on same strand, but likely hybridization on the other strand
-                        ddG = self._free_energy_of_formation(probe, target_seq)
-                        if ddG <= self.free_energy_threshold:
-                            window_hits.add(hit.query_id)
-                            fout.write('%s\t%s\t%.1f\t%.1f\t%.1f\t%.2f\n' % (hit.query_id, 
-                                                                                hit.subject_id, 
-                                                                                query_aln_frac,
-                                                                                hit.perc_identity,
-                                                                                adjusted_perc_identity,
-                                                                                ddG))
-                        else:
-                            failed_free_energy_test.add(hit.query_id)
+                        window_hits.add(hit.query_id)
+                        fout.write('%s\t%s\t%.1f\t%.1f\t%.1f\n' % (hit.query_id, 
+                                                                            hit.subject_id, 
+                                                                            query_aln_frac,
+                                                                            hit.perc_identity,
+                                                                            adjusted_perc_identity))
                 else:
                     failed_similarity_test.add(hit.query_id)
             fout.close()
             
-            num_failed_free_energy_test = len(failed_free_energy_test - window_hits)
-            num_failed_similarity_test = len(target_windows) - num_failed_free_energy_test - len(window_hits) # need to account for probes with no blast hit
+            num_failed_similarity_test = len(target_windows) - len(window_hits)
             
             output_file = os.path.join(results_dir, ref_name + '~' + target_name + '.summary.tsv')
             fout = open(output_file, 'w')
             fout.write('Reference ID\tReference genome size (bp)')
             fout.write('\tTarget ID\tTarget genome size (bp)')
-            fout.write('\tNo. reference probes\tNo. target probes\tNo. hybridized probes\tNo. probes failing genomic similarity test\tNo. probes failing free energy test\n')
+            fout.write('\tNo. reference probes\tNo. target probes\tNo. hybridized probes\tNo. probes failing genomic similarity test')
+            fout.write('\tPredict signal intensity\n')
             
             fout.write('%s\t%d' % (ref_name, ref_genome_size))
             fout.write('\t%s\t%d' % (target_name, target_genome_size))
-            fout.write('\t%d\t%d\t%d\t%d\t%d' % (num_ref_probes, len(target_windows), len(window_hits), num_failed_similarity_test, num_failed_free_energy_test))
+            fout.write('\t%d\t%d\t%d\t%d' % (num_ref_probes, len(target_windows), len(window_hits), num_failed_similarity_test))
+            fout.write('\t%.1f' % (len(window_hits)*100.0/len(target_windows)))
             fout.write('\n')
             fout.close()
             
@@ -381,7 +317,7 @@ class ProbeMatches(object):
         fout.write('Reference ID\tReference genome size (bp)')
         fout.write('\tTarget ID\tTarget genome size')
         fout.write('\tANI (%)\tShared genes (%)')
-        fout.write('\tNo. reference probes\tNo. target probes\tNo. hybridized probes\tNo. probes failing genomic similarity test\tNo. probes failing free energy test\n')
+        fout.write('\tNo. reference probes\tNo. target probes\tNo. hybridized probes\tNo. probes failing genomic similarity test\tPredict signal intensity\n')
         for result_file in os.listdir(results_dir):
             if not result_file.endswith('.summary.tsv'):
                 continue
@@ -403,12 +339,12 @@ class ProbeMatches(object):
                     num_target_probes = int(line_split[5])
                     hybridized_probes = int(line_split[6])
                     failed_similarity_test = int(line_split[7])
-                    failed_free_energy_test = int(line_split[8])
+                    predicted_signal_intensity = float(line_split[8])
    
                     fout.write('%s\t%s' % (ref_name, ref_genome_size))
                     fout.write('\t%s\t%s' % (target_name, target_genome_size))
                     fout.write('\t%.2f\t%.2f' % (ani[ref_name][target_name], of[ref_name][target_name]))
-                    fout.write('\t%d\t%d\t%d\t%d\t%d' % (num_ref_probes, num_target_probes, hybridized_probes, failed_similarity_test, failed_free_energy_test))
+                    fout.write('\t%d\t%d\t%d\t%d\t%.1f' % (num_ref_probes, num_target_probes, hybridized_probes, failed_similarity_test, predicted_signal_intensity))
                     fout.write('\n')
                  
         fout.close()
@@ -502,24 +438,16 @@ if __name__ == '__main__':
     parser.add_argument('ani_matrix', help='matrix with ANI results')
     parser.add_argument('output_dir', help='output directory')
     parser.add_argument('--probe_size', help='probe/window size', type=int, default=120)
-    parser.add_argument('--probe_step_size', help='step size for generating in silico probes', type=int, default=120)
+    parser.add_argument('--probe_step_size', help='step size for generating in silico probes', type=int, default=10)
     parser.add_argument('--mismatch', help='maximum percent mismatch between probe and target for hybridization [0,1]', type=float, default=0.15)
     parser.add_argument('--min_aln_len', help='minimum percent alignment length of probe for hybridization [0,1]', type=float, default=0.85)
-    parser.add_argument('--temp', help='temperature for calculating the free energy penalty', type=float, default=48)
-    parser.add_argument('--na_plus', help='concentration of Na+ for calculating the free energy penalty', type=float, default=0.825)
-    parser.add_argument('--ct', help='nucleic acid concentration in M for calculating the free energy penalty', type=float, default=0.000000005)
-    parser.add_argument('--free_energy_threshold', help='threshold for free energy penalty', type=float, default=2)
     parser.add_argument('--keep_fragments', action='store_true', help='retain file with query fragments')
     parser.add_argument('-t', '--threads', help='number of threads', type=int, default=1)
 
     args = parser.parse_args()
 
     try:
-        p = ProbeMatches(args.temp,
-                            args.na_plus,
-                            args.ct,
-                            args.free_energy_threshold,
-                            args.output_dir)
+        p = ProbeMatches(args.output_dir)
         p.run(args.genome_dir, 
                 args.probe_size,
                 args.probe_step_size,
